@@ -4,7 +4,7 @@ from Yuna_MPC import YunaMPC
 import numpy as np
 import time
 # command
-comm_lin_vel = np.array([1.0, 0.0, 0.0])
+comm_lin_vel = np.array([0.0, 0.0, 0.0])
 comm_ang_vel = 0.0
 
 def main():

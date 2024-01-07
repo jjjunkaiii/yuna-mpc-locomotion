@@ -9,6 +9,7 @@ class YunaMPC():
         self.gait_scheduler = Gait_scheduler(self.env)
         self.swing_leg_controller = Swing_leg_controller(self.env, self.gait_scheduler)
         self.stance_leg_controller = Stance_leg_controller(self.env, self.gait_scheduler)
+        # self.stance_leg_controller = Stance_leg_controller_RH(self.env, self.gait_scheduler)
         self.last_action = None #np.array([self.env.p.getJointState(self.env.YunaID, i)[3] for i in self.env.actuator])
 
     def get_action(self):
@@ -269,6 +270,139 @@ class Stance_leg_controller():
         # solve for contact forces
         contact_force = quadprog.solve_qp(G, a, C, b)
         contact_force = -contact_force[0].reshape((6, 3)) # Newton's third law, the reactive force
+        #contact_force[:, 0:2] = -contact_force[:, 0:2]
+        return contact_force # order in bullet frame
+    
+    def _map_force_to_torque(self, contact_force):
+        motor_torque = np.zeros(18)
+        Jv = self.env.get_jacobian()# np.zeros([6, 3, 6])
+        for leg_id in range(6):
+            J_leg = Jv[:, :, leg_id]
+            F_leg = np.append(contact_force[leg_id, :], np.zeros(3,)).T # F_leg is in bullet order already
+            motor_torque[leg_id * 3:leg_id * 3 + 3] = J_leg.T @ F_leg
+        motor_torque = hebi2bullet(motor_torque)
+        return motor_torque # order in bullet frame
+
+
+class Stance_leg_controller_RH():
+    def __init__(self, env, gait_scheduler):
+        # Receding Horizon version of stance leg controller, it will make multiple steps prediction
+        self.env = env
+        self.gait_scheduler = gait_scheduler
+        self.KP = np.array((0., 0., 100., 100., 100., 0.))*0.1 # TODO
+        self.KD = np.array((40., 30., 10., 10., 10., 30.))*0.1 # TODO
+        self.dt = self.env.dt
+        self.pred_hrz = 2
+
+    def get_horizon(self, prediction_horizon, execution_horizon):
+        assert prediction_horizon >= execution_horizon
+        self.pred_hrz = prediction_horizon
+        self.exec_hrz = execution_horizon
+
+    def get_action(self):
+        contact_force = self._compute_contact_force()
+        joint_torques = self._map_force_to_torque(contact_force)
+        return joint_torques
+    
+    def get_command(self, vel_l, vel_a):
+        self.des_vel_l = vel_l
+        self.des_vel_a = vel_a
+
+    def _compute_mass_matrix(self):
+        rot_z = np.eye(3) # mass matrix is in body frame so no rotation about z axis
+        body_mass = self.env.robot_body_mass
+        body_inertia = self.env.robot_body_inertia
+        foot_pos = self.env.get_foot_position_in_CoM_frame()
+
+        inv_mass = np.eye(3) / body_mass
+        inv_inertia = np.linalg.inv(body_inertia)
+
+        # compute mass matrix
+        mass_mat = np.zeros((6, 18))
+        for leg_id in range(6):
+            # first 3 rows are mass
+            mass_mat[:3, leg_id * 3:leg_id * 3 + 3] = inv_mass
+            # last 3 rows are inertia
+            foot_pos_skew = skew_matrix(foot_pos[:, leg_id])
+            mass_mat[3:6, leg_id * 3:leg_id * 3 + 3] = rot_z.T.dot(inv_inertia).dot(foot_pos_skew)
+        # expand mass matrix to horizon
+        mass_mat_hat = self.dt * mass_mat
+        M = np.zeros((6 * self.pred_hrz, 18 * self.pred_hrz))
+        for i in range(self.pred_hrz): # row
+            for j in range(self.pred_hrz): # column
+                if i>=j:
+                    M[i*6:(i+1)*6, j*18:(j+1)*18] = mass_mat_hat
+        return M
+    
+    def _compute_error_matrix(self):
+        des_vel_l = np.array([self.des_vel_l[0], self.des_vel_l[1], 0.])
+        des_vel_a = np.array([0., 0., self.des_vel_a])
+        x_ref = np.hstack((des_vel_l, des_vel_a))
+        X_ref = np.tile(x_ref, self.pred_hrz)
+        x = np.hstack((self.env.get_robot_linear_velocity_filtered(), self.env.get_robot_angular_velocity()))
+        X = np.tile(x, self.pred_hrz)
+        g_hat = np.array([0., 0., self.env.gravity*self.dt, 0., 0., 0.])
+        G_hat = np.concatenate([g_hat * (i+1) for i in range(self.pred_hrz)])
+        Delta_X = X_ref - X + G_hat
+        return Delta_X
+    
+    def _compute_objective_matrix(self):
+        Q = np.diag(np.tile(np.array([1., 1., 1., 10., 10, 1.]), self.pred_hrz))#TODO: tune this
+        R = np.tile(np.ones(18) * 1e-4, self.pred_hrz)
+        M = self._compute_mass_matrix()
+        Delta_X = self._compute_error_matrix()
+        # Compute G and a
+        G = M.T @ Q @ M + R
+        a = Delta_X.T @ Q @ M #in quadprog, the objective function is 1/2 x^T G x - a^T x
+        return G, a
+
+    def _compute_constraint_matrix(self, contacts):
+        mu = self.env.friction * 0.5 # lower the possibility of slipping TODO: tune this coefficient
+        f_min = 1e-3* self.env.robot_body_mass * self.env.gravity #TODO: modify the ratio
+        f_max = 1 * self.env.robot_body_mass * self.env.gravity #TODO: check the max GRF
+        C = np.zeros((36, 18))
+        b = np.zeros(36)
+        # ground reaction force constraints in first 12 rows
+        # -f_min <= f_z <= f_max if in contact
+        # -1e-7 <= f_z <= 1e-7 if not in contact
+        for leg_id in range(6):
+            C[leg_id * 2, leg_id * 3 + 2] = 1
+            C[leg_id * 2 + 1, leg_id * 3 + 2] = -1
+            if contacts[leg_id]:
+                b[leg_id * 2], b[leg_id * 2 + 1] = f_min, -f_max
+            else:
+                b[leg_id * 2] = -1e-7
+                b[leg_id * 2 + 1] = -1e-7
+        # friction constraints in last 24 rows
+        # -mu*f_z <= f_x <= mu*f_z
+        # -mu*f_z <= f_y <= mu*f_z
+        for leg_id in range(6):
+            row_id = 12 + leg_id * 4
+            col_id = leg_id * 3
+            C[row_id + 0, col_id:col_id + 3] = np.array([1, 0, mu])
+            C[row_id + 1, col_id:col_id + 3] = np.array([-1, 0, mu])
+            C[row_id + 2, col_id:col_id + 3] = np.array([0, 1, mu])
+            C[row_id + 3, col_id:col_id + 3] = np.array([0, -1, mu])
+            # b already initialized to 0 so no need to reassign 0 to b
+        C = C.T # transpose to match the format of qp solver
+        C = np.tile(C, (self.pred_hrz,1))
+        return C, b
+    
+    def _compute_contact_force(self):
+        # contacts = self.env.get_foot_contact()
+        # contacts = np.array(
+        # [leg_state == self.gait_scheduler.STANCE
+        #  for leg_state in self.gait_scheduler.desired_leg_state],
+        # dtype=np.int32)
+        desired_contacts = self.gait_scheduler.desired_leg_state
+        actual_contacts = self.env.get_foot_contact()
+        contacts = np.logical_and(desired_contacts, actual_contacts)
+        G, a = self._compute_objective_matrix()
+        G += np.eye(G.shape[0]) * 1e-8# TODO: check if this is necessary
+        C, b = self._compute_constraint_matrix(contacts)
+        # solve for contact forces
+        contact_force = quadprog.solve_qp(G, a, C, b)
+        contact_force = -contact_force[0][:18].reshape((6, 3)) # Newton's third law, the reactive force
         #contact_force[:, 0:2] = -contact_force[:, 0:2]
         return contact_force # order in bullet frame
     
